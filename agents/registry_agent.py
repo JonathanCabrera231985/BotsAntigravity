@@ -100,6 +100,9 @@ class AgenteRegistroGoogleSheets(Agente):
                 # Intentar abrir la hoja
                 try:
                     sheet = client.open(self.nombre_hoja).sheet1
+                    # Verificamos si está vacía para colocar cabeceras
+                    if not sheet.get_all_values():
+                        sheet.append_row(columnas)
                 except gspread.exceptions.SpreadsheetNotFound:
                     # Crear una nueva hoja si no existe
                     logger.info(f"Hoja '{self.nombre_hoja}' no encontrada. Creándola...")
@@ -111,6 +114,23 @@ class AgenteRegistroGoogleSheets(Agente):
                 
                 # Escribir la nueva fila
                 sheet.append_row(datos_fila)
+                
+                # Aplicar formato gerencial
+                try:
+                    sheet.freeze(rows=1)
+                    sheet.format("A1:H1", {
+                        "backgroundColor": {"red": 0.1, "green": 0.2, "blue": 0.4},
+                        "textFormat": {"foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "bold": True},
+                        "horizontalAlignment": "CENTER"
+                    })
+                    sheet.format("A2:H1000", {
+                        "wrapStrategy": "WRAP",
+                        "verticalAlignment": "TOP"
+                    })
+                    logger.info("Formato de informe gerencial aplicado exitosamente.")
+                except Exception as e_fmt:
+                    logger.warning(f"No se pudo aplicar el formato de celdas: {e_fmt}")
+
                 logger.info(f"Registro exitoso en Google Sheets: '{self.nombre_hoja}'")
                 return True
             except Exception as e:
@@ -150,3 +170,195 @@ class AgenteRegistroGoogleSheets(Agente):
         except Exception as e:
             logger.error(f"Error crítico al escribir en el archivo CSV local: {str(e)}")
             return False
+
+    def escribir_reporte_gerencial(self, contenido_markdown: str, nombre_pestana: str = "Reporte Técnico") -> bool:
+        """
+        Guarda el reporte Markdown compilado de forma estructurada y con diseño premium 
+        en una nueva pestaña dentro del Google Sheet.
+        """
+        if not GOOGLE_SHEETS_AVAILABLE or not os.path.exists(self.ruta_credenciales):
+            logger.warning("No hay credenciales o dependencias para Google Sheets. Guardando reporte en archivo local Markdown.")
+            ruta_reporte = os.path.join(self.ruta_proyecto, f"{nombre_pestana.replace(' ', '_')}.md")
+            with open(ruta_reporte, 'w', encoding='utf-8') as f:
+                f.write(contenido_markdown)
+            return True
+            
+        try:
+            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            creds = ServiceAccountCredentials.from_json_keyfile_name(self.ruta_credenciales, scope)
+            client = gspread.authorize(creds)
+            sh = client.open(self.nombre_hoja)
+            
+            # Intentar obtener la pestaña o crearla
+            try:
+                sheet = sh.worksheet(nombre_pestana)
+                sheet.clear()
+            except gspread.exceptions.WorksheetNotFound:
+                sheet = sh.add_worksheet(title=nombre_pestana, rows="200", cols="10")
+                
+            # --- PARSER DE MARKDOWN ---
+            import re
+            lines = contenido_markdown.strip().split('\n')
+            grid = []
+            
+            # Guardar estilos especiales por fila (1-indexed para gspread)
+            titulos = []
+            subtitulos = []
+            subsubtitulos = []
+            cabeceras_tabla = []
+            filas_codigo = []
+            filas_negrita = []
+            
+            current_row = 1
+            in_table = False
+            in_code_block = False
+            
+            for line in lines:
+                line_strip = line.strip()
+                if not line_strip:
+                    grid.append([""])
+                    current_row += 1
+                    continue
+                
+                # Bloques de código (```)
+                if line_strip.startswith('```'):
+                    in_code_block = not in_code_block
+                    continue
+                
+                if in_code_block:
+                    grid.append(["    " + line])
+                    filas_codigo.append(current_row)
+                    current_row += 1
+                    continue
+                
+                # Títulos (# ...)
+                if line_strip.startswith('# '):
+                    grid.append([line_strip[2:].strip()])
+                    titulos.append(current_row)
+                    current_row += 1
+                elif line_strip.startswith('## '):
+                    grid.append([line_strip[3:].strip()])
+                    subtitulos.append(current_row)
+                    current_row += 1
+                elif line_strip.startswith('### '):
+                    grid.append([line_strip[4:].strip()])
+                    subsubtitulos.append(current_row)
+                    current_row += 1
+                elif line_strip.startswith('#### '):
+                    grid.append([line_strip[5:].strip()])
+                    subsubtitulos.append(current_row)
+                    current_row += 1
+                # Tablas (| ... |)
+                elif line_strip.startswith('|'):
+                    if '---' in line_strip:
+                        continue
+                    cells = [c.strip() for c in line_strip.split('|')[1:-1]]
+                    grid.append(cells)
+                    if not in_table:
+                        in_table = True
+                        cabeceras_tabla.append(current_row)
+                    current_row += 1
+                else:
+                    in_table = False
+                    # Verificar si es clave-valor bold (e.g. **Clave**: Valor)
+                    bold_match = re.match(r'^\*\*(.*?)\*\*:\s*(.*)$', line_strip)
+                    if bold_match:
+                        key, val = bold_match.groups()
+                        val_clean = val.replace('`', '')
+                        grid.append([key + ":", val_clean])
+                        filas_negrita.append(current_row)
+                    else:
+                        # Si tiene formato markdown negrita dentro del texto, lo limpiamos de backticks y asteriscos
+                        cleaned = line_strip.replace('**', '').replace('`', '')
+                        grid.append([cleaned])
+                    current_row += 1
+            
+            # Escribir toda la data de una sola vez
+            if grid:
+                # Completar filas para que tengan al menos el ancho de la más larga
+                max_cols = max(len(row) for row in grid) if grid else 1
+                grid_normalized = [row + [""] * (max_cols - len(row)) for row in grid]
+                
+                # Encontrar el rango de letras (ej. A1:E200)
+                letra_col_fin = chr(ord('A') + max_cols - 1)
+                rango_total = f"A1:{letra_col_fin}{len(grid_normalized)}"
+                sheet.update(rango_total, grid_normalized)
+                
+                # --- APLICAR ESTILOS PREMIUM ---
+                # 1. Configuración por defecto: Ajustar texto y alineación superior
+                sheet.format(f"A1:{letra_col_fin}{len(grid_normalized)}", {
+                    "wrapStrategy": "WRAP",
+                    "verticalAlignment": "TOP",
+                    "textFormat": {"fontFamily": "Arial", "fontSize": 10}
+                })
+                
+                # 2. Títulos principales
+                for row_idx in titulos:
+                    sheet.format(f"A{row_idx}:{letra_col_fin}{row_idx}", {
+                        "textFormat": {"bold": True, "fontSize": 14, "foregroundColor": {"red": 0.1, "green": 0.2, "blue": 0.4}}
+                    })
+                
+                # 3. Subtítulos
+                for row_idx in subtitulos:
+                    sheet.format(f"A{row_idx}:{letra_col_fin}{row_idx}", {
+                        "backgroundColor": {"red": 0.9, "green": 0.93, "blue": 0.98},
+                        "textFormat": {"bold": True, "fontSize": 11, "foregroundColor": {"red": 0.15, "green": 0.25, "blue": 0.45}}
+                    })
+                
+                # 4. Sub-subtítulos
+                for row_idx in subsubtitulos:
+                    sheet.format(f"A{row_idx}:{letra_col_fin}{row_idx}", {
+                        "textFormat": {"bold": True, "fontSize": 10, "foregroundColor": {"red": 0.2, "green": 0.3, "blue": 0.5}}
+                    })
+                
+                # 5. Cabeceras de Tabla
+                for row_idx in cabeceras_tabla:
+                    sheet.format(f"A{row_idx}:{letra_col_fin}{row_idx}", {
+                        "backgroundColor": {"red": 0.1, "green": 0.2, "blue": 0.4},
+                        "textFormat": {"foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "bold": True},
+                        "horizontalAlignment": "CENTER"
+                    })
+                
+                # 6. Filas de Código
+                for row_idx in filas_codigo:
+                    sheet.format(f"A{row_idx}:{letra_col_fin}{row_idx}", {
+                        "textFormat": {"fontFamily": "Courier New", "fontSize": 9, "foregroundColor": {"red": 0.3, "green": 0.3, "blue": 0.3}}
+                    })
+                    
+                # 7. Filas de Negrita (Key-Value)
+                for row_idx in filas_negrita:
+                    sheet.format(f"A{row_idx}", {
+                        "textFormat": {"bold": True}
+                    })
+            
+            logger.info(f"Reporte técnico guardado y formateado exitosamente en la pestaña '{nombre_pestana}'.")
+            return True
+        except Exception as e:
+            logger.error(f"Error al escribir y formatear el reporte gerencial en Google Sheets: {str(e)}")
+            return False
+
+    def eliminar_pestanas_excedentes(self, nombres_validos: List[str]) -> None:
+        """
+        Elimina las pestañas de 'Reporte Técnico-xxx' que no estén en la lista de nombres_validos.
+        """
+        if not GOOGLE_SHEETS_AVAILABLE or not os.path.exists(self.ruta_credenciales):
+            return
+            
+        try:
+            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            creds = ServiceAccountCredentials.from_json_keyfile_name(self.ruta_credenciales, scope)
+            client = gspread.authorize(creds)
+            sh = client.open(self.nombre_hoja)
+            
+            for ws in sh.worksheets():
+                name = ws.title
+                if name.startswith("Reporte Técnico-"):
+                    if name not in nombres_validos:
+                        logger.info(f"Eliminando pestaña excedente: {name}")
+                        try:
+                            sh.del_worksheet(ws)
+                        except Exception as e_del:
+                            logger.warning(f"No se pudo eliminar la pestaña {name}: {e_del}")
+        except Exception as e:
+            logger.error(f"Error al conectar para eliminar pestañas excedentes: {e}")
+

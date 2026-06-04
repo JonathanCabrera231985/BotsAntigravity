@@ -1,1 +1,6 @@
-credentials.json 
+credentials.json
+__pycache__/
+*.pyc
+venv/
+.hu_cache.json
+*.log

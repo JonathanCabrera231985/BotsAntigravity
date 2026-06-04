@@ -142,9 +142,97 @@ class AgenteLectorHistoriaUsuario(Agente):
             "Funcionalidad a Modificar": funcionalidad,
             "Reglas de Negocio Nuevas/Modificadas": reglas_negocio,
             "Impacto Esperado": impacto,
-            "ReporteMarkdown": self._formatear_markdown(funcionalidad, reglas_negocio, impacto)
+            "ReporteMarkdown": self._formatear_markdown(funcionalidad, reglas_negocio, impacto),
+            "HistoriasBacklog": self.parse_backlog(contenido)
         }
         return resumen
+
+    def parse_backlog(self, text: str) -> list:
+        """
+        Parsea el backlog completo del documento de SonarQube en Historias de Usuario estructuradas.
+        """
+        parts = text.split("Historia de Usuario:")
+        stories = []
+        
+        for part in parts[1:]:
+            lines = part.strip().split('\n')
+            if not lines:
+                continue
+            title = lines[0].strip()
+            
+            # Extraer códigos de regla de SonarQube (ej. python:S4830)
+            sonar_rules = re.findall(r'(python:S\d+)', title)
+            
+            description = ""
+            criteria = []
+            effort = "0.0h"
+            cases = []
+            
+            current_section = None
+            for line in lines[1:]:
+                line_strip = line.strip()
+                if not line_strip:
+                    continue
+                
+                if line_strip.startswith("Descripción:") or line_strip.startswith("Descripcion:"):
+                    current_section = "desc"
+                    description = line_strip[12:].strip()
+                    continue
+                elif line_strip.startswith("Criterios de Aceptación:") or line_strip.startswith("Criterios de Aceptacion:"):
+                    current_section = "criteria"
+                    continue
+                elif line_strip.startswith("Esfuerzo Estimado:"):
+                    current_section = "effort"
+                    effort = line_strip[18:].strip()
+                    continue
+                elif line_strip.startswith("Casos de Prueba:"):
+                    current_section = "cases"
+                    continue
+                    
+                if current_section == "desc":
+                    description += " " + line_strip
+                elif current_section == "criteria":
+                    criteria.append(line_strip)
+                elif current_section == "cases":
+                    cases.append(line_strip)
+                    
+            # Determinar categoría y ID de HU
+            category = "MANT"
+            category_name = "Mantenibilidad"
+            if any(r in ["python:S4830"] for r in sonar_rules):
+                category = "SEC"
+                category_name = "Seguridad"
+            elif any(r in ["python:S3516"] for r in sonar_rules):
+                category = "CONF"
+                category_name = "Confiabilidad"
+                
+            count = sum(1 for s in stories if s["category"] == category) + 1
+            hu_id = f"HU-{category}-{count:02d}"
+            
+            effort_hours = 0.0
+            eff_match = re.search(r'([\d.]+)', effort)
+            if eff_match:
+                effort_hours = float(eff_match.group(1))
+                
+            # Buscar menciones a archivos .py
+            files_mentioned = re.findall(r'([a-zA-Z0-9_-]+\.py)', part)
+            files_mentioned = list(set(files_mentioned))
+            
+            stories.append({
+                "id": hu_id,
+                "title": title,
+                "category": category,
+                "category_name": category_name,
+                "description": description.strip(),
+                "criteria": criteria,
+                "effort": effort,
+                "effort_hours": effort_hours,
+                "cases": cases,
+                "sonar_rules": sonar_rules,
+                "files_mentioned": files_mentioned,
+                "raw_block": part
+            })
+        return stories
 
     def _formatear_markdown(self, funcionalidad: str, reglas: list, impacto: str) -> str:
         reporte = [
@@ -154,3 +242,4 @@ class AgenteLectorHistoriaUsuario(Agente):
         reporte.extend([f"  {r}" for r in reglas])
         reporte.append(f"- **Impacto Esperado:** {impacto}")
         return "\n".join(reporte)
+

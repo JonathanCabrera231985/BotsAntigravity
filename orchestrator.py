@@ -83,6 +83,54 @@ class Orquestador:
                 resumen_hu = self.lector_hu.leer_historia_usuario(ruta_hu)
                 if resumen_hu:
                     self.logger.info("Resumen de Historia de Usuario extraído correctamente.")
+                    
+                    # --- CACHE DE MODIFICACIONES DE GOOGLE DOCS ---
+                    import hashlib
+                    import json
+                    
+                    cache_path = os.path.join(self.ruta_proyecto, ".hu_cache.json")
+                    hu_actual_txt = resumen_hu.get('ReporteMarkdown', '')
+                    hu_hash_actual = hashlib.md5(hu_actual_txt.encode('utf-8')).hexdigest()
+                    
+                    documento_modificado = True
+                    if os.path.exists(cache_path):
+                        try:
+                            with open(cache_path, 'r', encoding='utf-8') as f:
+                                cache_data = json.load(f)
+                            if cache_data.get(ruta_hu) == hu_hash_actual:
+                                documento_modificado = False
+                        except Exception as e_cache:
+                            self.logger.warning(f"No se pudo leer el caché de HUs: {e_cache}")
+                            
+                    if not documento_modificado:
+                        self.logger.info("El documento de Google Docs no ha recibido modificaciones desde la última ejecución.")
+                        print("\n" + "="*80)
+                        print(" AVISO: El documento de Google Docs no ha recibido ninguna modificación.")
+                        print("="*80)
+                        while True:
+                            aplicar = input(">>> ¿Desea aplicar la solicitud de esas historias de usuario igualmente? (s/n): ").strip().lower()
+                            if aplicar in ['s', 'si', 'yes', 'y']:
+                                self.logger.info("El usuario decidió aplicar la Historia de Usuario sin modificar.")
+                                break
+                            elif aplicar in ['n', 'no']:
+                                self.logger.info("El usuario rechazó aplicar la Historia de Usuario. Se usará el análisis puro de código.")
+                                resumen_hu = None  # Descartar las reglas de negocio
+                                break
+                            else:
+                                print("Entrada no reconocida. Ingrese 's' para Sí o 'n' para No.")
+                    
+                    # Actualizar caché si todavía se decide usar
+                    if resumen_hu:
+                        try:
+                            cache_data = {}
+                            if os.path.exists(cache_path):
+                                with open(cache_path, 'r', encoding='utf-8') as f:
+                                    cache_data = json.load(f)
+                            cache_data[ruta_hu] = hu_hash_actual
+                            with open(cache_path, 'w', encoding='utf-8') as f:
+                                json.dump(cache_data, f, indent=2)
+                        except Exception as e_cache:
+                            self.logger.warning(f"No se pudo escribir en el caché de HUs: {e_cache}")
                 else:
                     self.logger.warning("No se pudo extraer la Historia de Usuario o el documento está vacío.")
 
@@ -93,17 +141,55 @@ class Orquestador:
             hu = self.analista.analizar_y_proponer(ruta_archivo)
             
             # Integrar requerimientos de negocio si se encontraron en el PASO 0
-            if resumen_hu:
+            historias_aplicables = []
+            if resumen_hu and 'HistoriasBacklog' in resumen_hu:
+                filename = os.path.basename(ruta_archivo).lower()
+                filename_no_ext = os.path.splitext(filename)[0]
+                for story in resumen_hu['HistoriasBacklog']:
+                    match = False
+                    for ref_file in story.get("files_mentioned", []):
+                        ref_file = ref_file.lower()
+                        ref_file_no_ext = os.path.splitext(ref_file)[0]
+                        if ref_file == filename:
+                            match = True
+                            break
+                        if ref_file_no_ext in filename_no_ext or filename_no_ext in ref_file_no_ext:
+                            match = True
+                            break
+                    if not match:
+                        title_lower = story.get("title", "").lower()
+                        desc_lower = story.get("description", "").lower()
+                        if "clibapiclient" in filename_no_ext and "clibapiclient" in (title_lower + desc_lower):
+                            match = True
+                        elif "munchery_spider" in filename_no_ext and "munchery_spider" in (title_lower + desc_lower):
+                            match = True
+                    if match:
+                        historias_aplicables.append(story)
+            
+            if historias_aplicables:
                 hu['Título'] = f"{resumen_hu['Funcionalidad a Modificar']} + Refactor"
                 hu['Contexto'] = f"Se leyeron reglas de negocio desde el documento externo.\n" + hu['Contexto']
-                hu['Descripción'] = "### 📋 Requerimientos de Negocio\n" + resumen_hu['ReporteMarkdown'] + "\n\n### 🔧 Análisis Estático del Código\n" + hu['Descripción']
-                # Prepend the acceptance criteria from the business
+                
+                stories_markdown = []
+                for s in historias_aplicables:
+                    stories_markdown.append(f"#### [{s['id']}] {s['title']}")
+                    stories_markdown.append(f"**Descripción**: {s['description']}")
+                    stories_markdown.append("**Criterios de Aceptación**:")
+                    for c in s['criteria']:
+                        stories_markdown.append(f"  - {c}")
+                    stories_markdown.append("")
+                    
+                hu['Descripción'] = "### [REQ] Requerimientos de Negocio\n" + "\n".join(stories_markdown) + "\n\n### [ANALISIS] Análisis Estático del Código\n" + hu['Descripción']
+                
                 criterios = "Escenario: Cumplimiento de Reglas de Negocio\n"
-                for regla in resumen_hu['Reglas de Negocio Nuevas/Modificadas']:
-                    criterios += f"  {regla}\n"
+                for s in historias_aplicables:
+                    for c in s['criteria']:
+                        criterios += f"  - {c}\n"
                 hu['Criterios de Aceptación'] = criterios + "\n" + hu['Criterios de Aceptación']
-                # Actualizar los casos de prueba para incluir los de negocio
                 hu['Casos de Prueba'] = self.analista.derivar_casos_prueba(hu['Criterios de Aceptación'])
+                hu['HistoriasAplicables'] = historias_aplicables
+            else:
+                hu['HistoriasAplicables'] = []
 
             
             # ---------------------------------------------------------
@@ -153,12 +239,50 @@ class Orquestador:
             if not qa_ok:
                 self.logger.error("Error durante la verificación de QA o la actualización de documentación.")
                 
+            # Subpaso 3.5: Generación del Reporte Técnico (SonarQube)
+            self.logger.info("Generando Reporte Técnico gerencial consolidado...")
+            from agents.report_agent import AgenteReporteTecnico
+            agente_reporte = AgenteReporteTecnico(self.ruta_proyecto)
+            reporte_markdown = agente_reporte.generar_reporte(ruta_archivo, resumen_hu, hu)
+            
+            # Guardarlo en una nueva pestaña dinámica según el archivo analizado (solo si tiene historias aplicables)
+            if hu.get('HistoriasAplicables'):
+                nombre_archivo_sin_ext = os.path.splitext(os.path.basename(ruta_archivo))[0]
+                nombre_pestana = f"Reporte Técnico-{nombre_archivo_sin_ext}"
+                self.registrador.escribir_reporte_gerencial(reporte_markdown, nombre_pestana=nombre_pestana)
+            else:
+                self.logger.info(f"Omitiendo creación de pestaña Google Sheets para {os.path.basename(ruta_archivo)} por falta de Historias de Usuario aplicables.")
+
             self.logger.info(f"=== CICLO COMPLETADO CON ÉXITO PARA: {os.path.basename(ruta_archivo)} ===")
             return True
             
         except Exception as e:
             self.logger.error(f"Error crítico no controlado durante el ciclo operativo: {str(e)}", exc_info=True)
             return False
+
+    def _limpiar_texto(self, texto: str) -> str:
+        if not texto:
+            return ""
+        # Reemplazar BOM y caracteres problemáticos comunes
+        texto_limpio = texto.replace('\ufeff', '').replace('\u200b', '')
+        # Reemplazar emojis comunes para evitar fallos en consolas Windows legacy
+        texto_limpio = (texto_limpio
+                        .replace("🚨", "[PEP 8]")
+                        .replace("🦨", "[CODE SMELLS]")
+                        .replace("📈", "[COMPLEJIDAD]")
+                        .replace("🛠️", "[REFACTOR]")
+                        .replace("📋", "[REQ]")
+                        .replace("🔧", "[ANALISIS]")
+                        .replace("", ""))
+        encoding = sys.stdout.encoding or 'utf-8'
+        try:
+            texto_bytes = texto_limpio.encode(encoding, errors='replace')
+            return texto_bytes.decode(encoding)
+        except Exception:
+            try:
+                return texto_limpio.encode('ascii', errors='replace').decode('ascii')
+            except Exception:
+                return "[Error de codificación de texto]"
 
     def _solicitar_aprobacion_humana(self, hu: Dict[str, Any]) -> bool:
         """
@@ -177,40 +301,44 @@ class Orquestador:
         print(f"|{'PROPUESTA DE HISTORIA DE USUARIO (HU) GENERADA POR AGENTE'.center(ancho_consola-2)}|")
         print(borde)
         
-        print(f"\n* TÍTULO: {hu.get('Título')}")
-        print(f"* CONTEXTO: {hu.get('Contexto')}")
+        titulo = self._limpiar_texto(hu.get('Título', ''))
+        contexto = self._limpiar_texto(hu.get('Contexto', ''))
+        desc = self._limpiar_texto(hu.get('Descripción', ''))
+        criterios = self._limpiar_texto(hu.get('Criterios de Aceptación', ''))
+        restricciones = self._limpiar_texto(hu.get('Restricciones Técnicas', ''))
+        impacto = self._limpiar_texto(hu.get('Impacto Estimado', ''))
+        criticidad = self._limpiar_texto(hu.get('Nivel de Criticidad', ''))
+
+        print(f"\n* TÍTULO: {titulo}")
+        print(f"* CONTEXTO: {contexto}")
         print(separador)
         
         print("* ANÁLISIS DE RIESGO:")
-        print(f"  - Nivel de Criticidad : \033[91m{hu.get('Nivel de Criticidad')}\033[0m" if hu.get('Nivel de Criticidad') in ['Alta', 'Crítica'] 
-              else f"  - Nivel de Criticidad : \033[92m{hu.get('Nivel de Criticidad')}\033[0m")
-        print(f"  - Impacto Estimado   : {hu.get('Impacto Estimado')}")
+        print(f"  - Nivel de Criticidad : \033[91m{criticidad}\033[0m" if criticidad in ['Alta', 'Crítica'] 
+              else f"  - Nivel de Criticidad : \033[92m{criticidad}\033[0m")
+        print(f"  - Impacto Estimado   : {impacto}")
         print(separador)
         
-        desc = hu.get('Descripción', '')
-        try:
-            # Intentar codificar en la codificación de la consola actual
-            desc.encode(sys.stdout.encoding or 'utf-8')
-        except (UnicodeEncodeError, LookupError):
-            # Fallback en caso de que no admita emojis
-            desc = desc.replace("🚨", "[PEP 8]").replace("🦨", "[CODE SMELLS]").replace("📈", "[COMPLEJIDAD]").replace("🛠️", "[REFACTOR]")
-            
         print(f"* DESCRIPCIÓN:\n{desc}")
         print(separador)
         
-        print(f"* CRITERIOS DE ACEPTACIÓN (Gherkin):\n{hu.get('Criterios de Aceptación')}")
+        print(f"* CRITERIOS DE ACEPTACIÓN (Gherkin):\n{criterios}")
         print(separador)
         
-        print(f"* RESTRICCIONES TÉCNICAS: {hu.get('Restricciones Técnicas')}")
+        print(f"* RESTRICCIONES TÉCNICAS: {restricciones}")
         print(separador)
         
         print("* CASOS DE PRUEBA DERIVADOS:")
         casos = hu.get("Casos de Prueba", [])
         for i, cp in enumerate(casos, 1):
-            print(f"  CP {i}: {cp.get('Escenario')}")
-            print(f"    Dado: {cp.get('Dado')}")
-            print(f"    Cuando: {cp.get('Cuando')}")
-            print(f"    Entonces: {cp.get('Entonces')}")
+            escenario = self._limpiar_texto(cp.get('Escenario', ''))
+            dado = self._limpiar_texto(cp.get('Dado', ''))
+            cuando = self._limpiar_texto(cp.get('Cuando', ''))
+            entonces = self._limpiar_texto(cp.get('Entonces', ''))
+            print(f"  CP {i}: {escenario}")
+            print(f"    Dado: {dado}")
+            print(f"    Cuando: {cuando}")
+            print(f"    Entonces: {entonces}")
             
         print(borde)
         
